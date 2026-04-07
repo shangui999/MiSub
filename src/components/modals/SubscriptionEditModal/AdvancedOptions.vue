@@ -42,4 +42,11 @@ const props = defineProps({
       class="h-4 w-4 rounded border-gray-300 text-slate-700 focus:ring-slate-500" />
     节点名称中的 + 视为空格
   </label>
+
+  <!-- 跳过证书验证 -->
+  <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+    <input type="checkbox" v-model="editingSubscription.skipCertVerify"
+      class="h-4 w-4 rounded border-gray-300 text-slate-700 focus:ring-slate-500" />
+    跳过 TLS 证书验证（用于 IP 地址自签名证书）
+  </label>
 </template>
