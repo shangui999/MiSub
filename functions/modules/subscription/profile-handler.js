@@ -84,8 +84,12 @@ export async function handleProfileMode(request, env, profileId, userAgent, appl
     });
 
     // 并行获取HTTP订阅节点
+    // 优先使用订阅配置中的 skipCertVerify，其次是传入的参数
     const subscriptionResults = await Promise.all(
-        targetSubscriptions.map(sub => fetchSubscriptionNodes(sub.url, sub.name, userAgent, sub.customUserAgent, false, sub.exclude, sub.fetchProxy, skipCertVerify, Boolean(sub?.plusAsSpace)))
+        targetSubscriptions.map(sub => {
+            const shouldSkipCertVerify = sub.skipCertVerify ?? skipCertVerify ?? false;
+            return fetchSubscriptionNodes(sub.url, sub.name, userAgent, sub.customUserAgent, false, sub.exclude, sub.fetchProxy, shouldSkipCertVerify, Boolean(sub?.plusAsSpace));
+        })
     );
 
     // 合并所有结果

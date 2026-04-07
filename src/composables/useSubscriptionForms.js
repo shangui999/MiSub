@@ -20,6 +20,7 @@ export function useSubscriptionForms({ addSubscription, updateSubscription }) {
             customUserAgent: 'MiSub',
             fetchProxy: '',
             plusAsSpace: false,
+            skipCertVerify: false,
             notes: ''
         };
         showModal.value = true;

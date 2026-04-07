@@ -53,7 +53,9 @@ export async function handleSingleSubscriptionMode(request, env, subscriptionId,
     }
 
     // HTTP订阅：获取节点
-    const result = await fetchSubscriptionNodes(subscription.url, subscription.name, userAgent, subscription.customUserAgent, false, subscription.exclude, subscription.fetchProxy, skipCertVerify, Boolean(subscription?.plusAsSpace));
+    // 优先使用订阅配置中的 skipCertVerify，其次是传入的参数
+    const shouldSkipCertVerify = subscription.skipCertVerify ?? skipCertVerify ?? false;
+    const result = await fetchSubscriptionNodes(subscription.url, subscription.name, userAgent, subscription.customUserAgent, false, subscription.exclude, subscription.fetchProxy, shouldSkipCertVerify, Boolean(subscription?.plusAsSpace));
 
     return {
         success: true,

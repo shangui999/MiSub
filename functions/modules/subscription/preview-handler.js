@@ -100,6 +100,7 @@ export async function handleSubscriptionNodesRequest(request, env) {
                 result = await handleProfileMode(request, env, profileId, userAgent, requestData.applyTransform !== undefined ? requestData.applyTransform : true, skipCertVerify);
                 break;
             case 'subscription':
+                // handleSingleSubscriptionMode 内部会优先使用订阅配置中的 skipCertVerify
                 result = await handleSingleSubscriptionMode(request, env, subscriptionId, userAgent, skipCertVerify);
                 break;
             case 'direct':
