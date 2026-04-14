@@ -6,7 +6,7 @@
 import { urlToClashProxy } from '../../utils/url-to-clash.js';
 import { getUniqueName } from './name-utils.js';
 import { groupNodeLinesByRegion } from './region-groups.js';
-import { POLICY_GROUPS, getBuiltinRules, getRemoteProviderDefinitions, DEFAULT_SELECT_GROUP, DEFAULT_RELAY_GROUP } from './builtin-rules-provider.js';
+import { POLICY_GROUPS, getBuiltinRules, getRemoteProviderDefinitions, DEFAULT_SELECT_GROUP, DEFAULT_RELAY_GROUP, pruneProxyGroups } from './builtin-rules-provider.js';
 
 function cleanControlChars(str) {
     if (typeof str !== 'string') return str;
@@ -112,6 +112,14 @@ function buildOutbound(proxy) {
             enabled: true,
             server_name: proxy.sni || proxy.servername || server
         };
+        if (proxy.network === 'ws') {
+            const wsOpts = proxy['ws-opts'] || proxy.wsOpts;
+            outbound.transport = {
+                type: 'ws',
+                path: wsOpts?.path || '/',
+                headers: wsOpts?.headers || {}
+            };
+        }
     } else if (type === 'hysteria2' || type === 'hy2') {
         outbound.type = 'hysteria2';
         outbound.server = server;
@@ -126,6 +134,15 @@ function buildOutbound(proxy) {
         outbound.server = server;
         outbound.server_port = port;
         outbound.uuid = proxy.uuid || '';
+        outbound.password = proxy.password || '';
+        outbound.tls = {
+            enabled: true,
+            server_name: proxy.sni || proxy.servername || server
+        };
+    } else if (type === 'anytls') {
+        outbound.type = 'anytls';
+        outbound.server = server;
+        outbound.server_port = port;
         outbound.password = proxy.password || '';
         outbound.tls = {
             enabled: true,
@@ -235,16 +252,24 @@ export function generateBuiltinSingboxConfig(nodeList, options = {}) {
     const levelKey = (ruleLevel || 'std').toUpperCase();
     // 获取内置策略组
     const policyGroupsFactory = POLICY_GROUPS[levelKey] || POLICY_GROUPS.STD;
-    const proxyGroups = policyGroupsFactory(outbounds);
+    let proxyGroups = policyGroupsFactory(outbounds);
+    proxyGroups = pruneProxyGroups(proxyGroups, outbounds);
 
     // 将抽象分组转换为 Sing-Box Outbounds
     const groupOutbounds = proxyGroups.map(group => {
-        const type = group.type === 'url-test' ? 'urltest' : 'selector';
+        let type = 'selector';
+        if (group.type === 'url-test') type = 'urltest';
+        if (group.type === 'fallback') type = 'urltest'; // Sing-Box 暂时映射为 urltest
+        
         return {
             tag: group.name,
             type: type,
             outbounds: group.proxies,
-            ...(type === 'urltest' ? { url: 'http://www.gstatic.com/generate_204', interval: '5m' } : {})
+            ...(type === 'urltest' ? { 
+                url: 'http://www.gstatic.com/generate_204', 
+                interval: '10m',
+                tolerance: 50 
+            } : {})
         };
     });
 

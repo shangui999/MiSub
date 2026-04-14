@@ -5,7 +5,7 @@
 
 import { urlToClashProxy } from '../../utils/url-to-clash.js';
 import { getUniqueName } from './name-utils.js';
-import { POLICY_GROUPS, getBuiltinRules, DEFAULT_SELECT_GROUP, DEFAULT_RELAY_GROUP } from './builtin-rules-provider.js';
+import { POLICY_GROUPS, getBuiltinRules, DEFAULT_SELECT_GROUP, DEFAULT_RELAY_GROUP, pruneProxyGroups } from './builtin-rules-provider.js';
 
 const ICON_REPO = 'https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color';
 
@@ -127,6 +127,39 @@ function buildQxLine(proxy) {
         return `http=${server}:${port}, username=${username}, password=${password}${extraParts.length > 0 ? `, ${extraParts.join(', ')}` : ''}, tag=${name}`;
     }
 
+    if (type === 'hysteria2' || type === 'hy2') {
+        const extraParts = [];
+        if (proxy.sni || proxy.servername) extraParts.push(`sni=${proxy.sni || proxy.servername}`);
+        appendQxTlsParams(extraParts, proxy);
+        return `hysteria2=${server}:${port}, password=${proxy.password || ''}${extraParts.length > 0 ? `, ${extraParts.join(', ')}` : ''}, tag=${name}`;
+    }
+
+    if (type === 'tuic') {
+        const parts = [];
+        if (proxy.uuid) parts.push(proxy.uuid || '');
+        if (proxy.password) parts.push(proxy.password || '');
+        if (proxy.sni || proxy.servername) parts.push(`sni=${proxy.sni || proxy.servername}`);
+        if (proxy['congestion-control']) parts.push(`congestion-controller=${proxy['congestion-control']}`);
+        if (proxy['udp-relay-mode']) parts.push(`udp-relay=${proxy['udp-relay-mode']}`);
+        if (proxy.alpn) {
+            const alpn = Array.isArray(proxy.alpn) ? proxy.alpn.join(',') : proxy.alpn;
+            parts.push(`alpn=${alpn}`);
+        }
+        appendQxTlsParams(parts, proxy);
+        return `tuic=${server}:${port}, ${parts.join(', ')}, tag=${name}`;
+    }
+
+    if (type === 'anytls') {
+        const extraParts = [`password=${proxy.password || ''}`];
+        if (proxy.sni || proxy.servername) extraParts.push(`sni=${proxy.sni || proxy.servername}`);
+        if (proxy.alpn) {
+            const alpn = Array.isArray(proxy.alpn) ? proxy.alpn.join(',') : proxy.alpn;
+            extraParts.push(`alpn=${alpn}`);
+        }
+        appendQxTlsParams(extraParts, proxy);
+        return `anytls=${server}:${port}, ${extraParts.join(', ')}, tag=${name}`;
+    }
+
     return null;
 }
 
@@ -180,7 +213,8 @@ export function generateBuiltinQuanxConfig(nodeList, options = {}) {
 
     const levelKey = (ruleLevel || 'std').toUpperCase();
     const policyFactory = POLICY_GROUPS[levelKey] || POLICY_GROUPS.STD;
-    const abstractGroups = policyFactory(proxiesWithMetadata);
+    let abstractGroups = policyFactory(proxiesWithMetadata);
+    abstractGroups = pruneProxyGroups(abstractGroups, proxiesWithMetadata);
 
     const groupIcons = {
         [DEFAULT_SELECT_GROUP]: `${ICON_REPO}/Proxy.png`,
@@ -234,4 +268,3 @@ export function generateBuiltinQuanxConfig(nodeList, options = {}) {
 
     return sections.join('\n\n') + '\n';
 }
-
