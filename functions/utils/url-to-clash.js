@@ -143,6 +143,16 @@ function parseVlessUrl(url) {
             }
         }
 
+        // HTTPUpgrade 配置
+        if (network === 'httpupgrade') {
+            const httpupgradeOpts = {};
+            if (params.get('path')) httpupgradeOpts.path = params.get('path');
+            if (params.get('host')) httpupgradeOpts.host = params.get('host');
+            if (Object.keys(httpupgradeOpts).length > 0) {
+                proxy['httpupgrade-opts'] = httpupgradeOpts;
+            }
+        }
+
         // 安全配置
         const security = params.get('security') || 'none';
 
@@ -159,10 +169,17 @@ function parseVlessUrl(url) {
             proxy.tls = true;
         }
 
+        // Skip cert verify (统一支持 allowInsecure 和 insecure)
+        if (params.get('allowInsecure') === '1' || params.get('insecure') === '1') {
+            proxy['skip-cert-verify'] = true;
+        }
+
 // SNI (支持 sni 和 peer 两种参数名，Shadowrocket 使用 peer)
       if (params.get('sni')) {
+        proxy.servername = params.get('sni');
         proxy.sni = params.get('sni');
       } else if (params.get('peer')) {
+        proxy.servername = params.get('peer');
         proxy.sni = params.get('peer');
       }
 
@@ -255,8 +272,10 @@ function parseTrojanUrl(url) {
 
         // SNI (支持 sni 和 peer 两种参数名，Shadowrocket 使用 peer)
         if (params.get('sni')) {
+            proxy.servername = params.get('sni');
             proxy.sni = params.get('sni');
         } else if (params.get('peer')) {
+            proxy.servername = params.get('peer');
             proxy.sni = params.get('peer');
         }
 
@@ -311,7 +330,7 @@ function parseVmessUrl(url) {
         const proxy = {
             name: config.ps || `VMess-${config.add}`,
             type: 'vmess',
-            server: config.add,
+            server: config.add || config.host || config.sni || '',
             port: parseInt(config.port),
             uuid: config.id,
             alterId: parseInt(config.aid) || 0,
@@ -336,11 +355,54 @@ function parseVmessUrl(url) {
             }
         }
 
+        // gRPC 配置
+        if (network === 'grpc') {
+            const grpcOpts = {};
+            if (config.path) grpcOpts['grpc-service-name'] = config.path; // vmess json sometimes use path for serviceName
+            if (config.host) grpcOpts['grpc-service-name'] = config.host; 
+            if (Object.keys(grpcOpts).length > 0) {
+                proxy['grpc-opts'] = grpcOpts;
+            }
+        }
+
+        // H2 (HTTP/2) 配置
+        if (network === 'h2') {
+            const h2Opts = {};
+            if (config.path) h2Opts.path = config.path;
+            if (config.host) h2Opts.host = config.host.split(',').map(h => h.trim());
+            if (Object.keys(h2Opts).length > 0) {
+                proxy['h2-opts'] = h2Opts;
+            }
+        }
+
+        // HTTP 配置
+        if (network === 'http') {
+            const httpOpts = {
+                path: config.path || '/',
+                headers: {
+                    Host: config.host ? config.host.split(',').map(h => h.trim()) : []
+                }
+            };
+            proxy['http-opts'] = httpOpts;
+        }
+
+        // QUIC 配置
+        if (network === 'quic') {
+            const quicOpts = {};
+            if (config.type) quicOpts.header = { type: config.type };
+            if (config.host) quicOpts.security = config.host;
+            if (config.path) quicOpts.key = config.path;
+            if (Object.keys(quicOpts).length > 0) {
+                proxy['quic-opts'] = quicOpts;
+            }
+        }
+
         // TLS
-        if (config.tls === 'tls') {
+        if (config.tls === 'tls' || config.tls === 'reality') {
             proxy.tls = true;
             if (config.sni) proxy.servername = config.sni;
             if (config.fp) proxy['client-fingerprint'] = config.fp;
+            if (config.alpn) proxy.alpn = String(config.alpn).split(',').map(s => s.trim());
         }
 
         // UDP
@@ -494,11 +556,12 @@ function parseHysteria2Url(url) {
 
         // SNI
         if (params.get('sni')) {
+            proxy.servername = params.get('sni');
             proxy.sni = params.get('sni');
         }
 
         // Skip cert verify
-        if (params.get('insecure') === '1') {
+        if (params.get('insecure') === '1' || params.get('allowInsecure') === '1') {
             proxy['skip-cert-verify'] = true;
         }
 
@@ -540,6 +603,10 @@ function parseTuicUrl(url) {
             token = decodeURIComponent(token);
         } catch { }
 
+        const tokenParts = token.split(':');
+        const uuid = tokenParts[0] || '';
+        const password = tokenParts[1] || '';
+
         let serverPart = body.substring(atIndex + 1);
         const queryIndex = serverPart.indexOf('?');
         const hashIndex = serverPart.indexOf('#');
@@ -559,12 +626,15 @@ function parseTuicUrl(url) {
             type: 'tuic',
             server,
             port,
-            token
+            uuid,
+            password
         };
 
         // SNI
-        if (params.get('sni')) {
-            proxy.sni = params.get('sni');
+        const sni = params.get('sni');
+        if (sni) {
+            proxy.servername = sni;
+            proxy.sni = sni;
         }
 
         // ALPN
@@ -573,13 +643,26 @@ function parseTuicUrl(url) {
         }
 
         // Skip cert verify
-        if (params.get('allowInsecure') === '1' || params.get('insecure') === '1') {
+        if (params.get('allowInsecure') === '1' || params.get('insecure') === '1' || params.get('allow_insecure') === '1') {
             proxy['skip-cert-verify'] = true;
         }
         
         // 拥塞控制
         if (params.get('congestion_control')) {
-            proxy['congestion-controller'] = params.get('congestion_control');
+            proxy['congestion-control'] = params.get('congestion_control');
+        }
+
+        // UDP Relay Mode
+        if (params.get('udp_relay_mode')) {
+            proxy['udp-relay-mode'] = params.get('udp_relay_mode');
+        }
+
+        // Reduce RTT & Fast Open
+        if (params.get('reduce_rtt') === '1' || params.get('reduce_rtt') === 'true') {
+            proxy['reduce-rtt'] = true;
+        }
+        if (params.get('fast_open') === '1' || params.get('fast_open') === 'true') {
+            proxy['fast-open'] = true;
         }
 
         // [重要] dialer-proxy 链式代理
@@ -745,6 +828,7 @@ function parseSnellUrl(url) {
             if (obfsHost) proxy['obfs-opts'].host = obfsHost;
         }
         if (params.get('udp-relay') === 'true') proxy.udp = true;
+        if (params.get('ecn') === 'true' || params.get('ecn') === '1') proxy.ecn = true;
         return proxy;
     } catch (e) {
         console.error('解析 Snell URL 失败:', e);
@@ -781,19 +865,164 @@ function parseAnytlsUrl(url) {
         }
 
         const { server, port } = parseHostPort(hostPortStr);
+        const safePort = isNaN(port) ? 443 : port;
         const params = parseQueryParams(url);
         const name = extractName(url);
 
-        const proxy = { name: name || `AnyTLS-${server}`, type: 'anytls', server, port, password };
+        const proxy = { 
+            name: name || `AnyTLS-${server}`, 
+            type: 'anytls', 
+            server, 
+            port: safePort, 
+            password 
+        };
         
-        if (params.get('sni')) proxy.sni = params.get('sni');
+        const sni = params.get('sni') || params.get('peer');
+        if (sni) {
+            proxy.servername = sni;
+            proxy.sni = sni;
+        }
+        
         if (params.get('alpn')) proxy.alpn = params.get('alpn').split(',');
-        if (params.get('insecure') === '1') proxy['skip-cert-verify'] = true;
+        if (params.get('insecure') === '1' || params.get('allowInsecure') === '1') proxy['skip-cert-verify'] = true;
 
         proxy.udp = true;
         return proxy;
     } catch (e) {
         console.error('解析 AnyTLS URL 失败:', e);
+        return null;
+    }
+}
+
+/**
+ * 将 HTTPS URL 转换为 Clash 代理对象
+ * @param {string} url - HTTPS URL
+ * @returns {Object|null} Clash 代理对象
+ */
+function parseHttpsUrl(url) {
+    try {
+        // https://username:password@server:port?params#name
+        const body = url.substring(8);
+        const atIndex = body.indexOf('@');
+        if (atIndex === -1) return null;
+
+        let userInfo = body.substring(0, atIndex);
+        let serverPart = body.substring(atIndex + 1);
+
+        const queryIndex = serverPart.indexOf('?');
+        const hashIndex = serverPart.indexOf('#');
+        if (queryIndex !== -1) {
+            serverPart = serverPart.substring(0, queryIndex);
+        } else if (hashIndex !== -1) {
+            serverPart = serverPart.substring(0, hashIndex);
+        }
+
+        const { server, port } = parseHostPort(serverPart);
+        const params = parseQueryParams(url);
+        const name = extractName(url);
+
+        let username = '';
+        let password = '';
+        const colonIndex = userInfo.indexOf(':');
+        if (colonIndex !== -1) {
+            username = decodeURIComponent(userInfo.substring(0, colonIndex));
+            password = decodeURIComponent(userInfo.substring(colonIndex + 1));
+        } else {
+            username = decodeURIComponent(userInfo);
+        }
+
+        const proxy = {
+            name: name || `HTTPS-${server}`,
+            type: 'https',
+            server,
+            port,
+            username,
+            password
+        };
+
+        if (params.get('sni')) {
+            proxy.servername = params.get('sni');
+            proxy.sni = params.get('sni');
+        } else if (params.get('peer')) {
+            proxy.servername = params.get('peer');
+            proxy.sni = params.get('peer');
+        }
+
+        if (params.get('allowInsecure') === '1' || params.get('insecure') === '1') {
+            proxy['skip-cert-verify'] = true;
+        }
+
+        proxy.udp = false;
+        return proxy;
+    } catch (e) {
+        console.error('解析 HTTPS URL 失败:', e);
+        return null;
+    }
+}
+
+/**
+ * 将 SOCKS5 URL 转换为 Clash 代理对象
+ * @param {string} url - SOCKS5 URL
+ * @returns {Object|null} Clash 代理对象
+ */
+function parseSocks5Url(url) {
+    try {
+        // socks5://username:password@server:port?tls=1#name
+        const body = url.substring(9);
+        const atIndex = body.indexOf('@');
+        if (atIndex === -1) return null;
+
+        let userInfo = body.substring(0, atIndex);
+        let serverPart = body.substring(atIndex + 1);
+
+        const queryIndex = serverPart.indexOf('?');
+        const hashIndex = serverPart.indexOf('#');
+        if (queryIndex !== -1) {
+            serverPart = serverPart.substring(0, queryIndex);
+        } else if (hashIndex !== -1) {
+            serverPart = serverPart.substring(0, hashIndex);
+        }
+
+        const { server, port } = parseHostPort(serverPart);
+        const params = parseQueryParams(url);
+        const name = extractName(url);
+
+        let username = '';
+        let password = '';
+        const colonIndex = userInfo.indexOf(':');
+        if (colonIndex !== -1) {
+            username = decodeURIComponent(userInfo.substring(0, colonIndex));
+            password = decodeURIComponent(userInfo.substring(colonIndex + 1));
+        } else {
+            username = decodeURIComponent(userInfo);
+        }
+
+        const useTls = params.get('tls') === '1' || params.get('tls') === 'true' || params.get('secure') === '1';
+        const proxy = {
+            name: name || `SOCKS5-${server}`,
+            type: useTls ? 'socks5-tls' : 'socks5',
+            server,
+            port,
+            username,
+            password,
+            udp: false
+        };
+
+        if (params.get('sni')) {
+            proxy.servername = params.get('sni');
+            proxy.sni = params.get('sni');
+        } else if (params.get('peer')) {
+            proxy.servername = params.get('peer');
+            proxy.sni = params.get('peer');
+        }
+
+        if (params.get('allowInsecure') === '1' || params.get('insecure') === '1') {
+            proxy['skip-cert-verify'] = true;
+        }
+
+        return proxy;
+    } catch (e) {
+        console.error('解析 SOCKS5 URL 失败:', e);
         return null;
     }
 }
@@ -827,11 +1056,17 @@ return parseSnellUrl(url);
 return parseWireguardUrl(url);
 } else if (lowerUrl.startsWith('anytls://')) {
 return parseAnytlsUrl(url);
+} else if (lowerUrl.startsWith('https://')) {
+return parseHttpsUrl(url);
+} else if (lowerUrl.startsWith('socks5://')) {
+return parseSocks5Url(url);
 }
 
 // 不支持的协议
 return null;
 }
+
+import { extractNodeMetadata } from '../modules/utils/metadata-extractor.js';
 
 /**
  * 批量将节点 URL 转换为 Clash 代理列表
@@ -842,7 +1077,22 @@ export function urlsToClashProxies(urls) {
     if (!Array.isArray(urls)) return [];
 
     return urls
-        .map(url => urlToClashProxy(url))
+        .map(url => {
+            const proxy = urlToClashProxy(url);
+            if (!proxy) return null;
+            
+            // [智能增强] 注入元数据
+            proxy.metadata = extractNodeMetadata(proxy.name);
+            
+            // [自动补全] 仅在名称中完全没有国旗 Emoji 时才尝试补全，避免干扰用户通过正则重命名后的结果
+            // [自动补全] 仅在名称中完全没有国旗/地球 Emoji 时才尝试补全，避免重复添加或干扰用户重命名
+            const HAS_EMOJI_REGEX = /([\u{1F1E6}-\u{1F1FF}]{2}|[\u{1F30D}-\u{1F30F}])/u;
+            if (proxy.metadata.flag && !HAS_EMOJI_REGEX.test(proxy.name)) {
+                proxy.name = `${proxy.metadata.flag} ${proxy.name}`;
+            }
+            
+            return proxy;
+        })
         .filter(proxy => proxy !== null);
 }
 

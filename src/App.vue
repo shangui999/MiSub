@@ -1,5 +1,5 @@
 <script setup>
-import { defineAsyncComponent, onMounted, watch, computed } from 'vue';
+import { defineAsyncComponent, onMounted, watch, computed, ref } from 'vue';
 import RouteErrorBoundary from './components/ui/RouteErrorBoundary.vue';
 import { useRoute } from 'vue-router';
 import { useThemeStore } from './stores/theme';
@@ -7,8 +7,10 @@ import { useSessionStore } from './stores/session';
 import { useToastStore } from './stores/toast';
 import { useDataStore } from './stores/useDataStore';
 import { useUIStore } from './stores/ui';
+import { useVersionStore } from './stores/version';
 import { storeToRefs } from 'pinia';
 import NavBar from './components/layout/NavBar.vue';
+import { detectLegacyD1 } from './lib/api.js';
 
 // Lazy components
 const Login = defineAsyncComponent(() => import('./components/modals/Login.vue'));
@@ -19,6 +21,8 @@ const Dashboard = defineAsyncComponent(() => import('./components/features/Dashb
 const Header = defineAsyncComponent(() => import('./components/layout/Header.vue'));
 const SavePrompt = defineAsyncComponent(() => import('./components/ui/SavePrompt.vue'));
 const ScrollToTop = defineAsyncComponent(() => import('./components/ui/ScrollToTop.vue'));
+const LegacyD1MigrationModal = defineAsyncComponent(() => import('./components/modals/LegacyD1MigrationModal.vue'));
+const VersionChangelogModal = defineAsyncComponent(() => import('./components/modals/VersionChangelogModal.vue'));
 
 const route = useRoute();
 const themeStore = useThemeStore();
@@ -26,7 +30,7 @@ const { theme } = storeToRefs(themeStore);
 const { initTheme } = themeStore;
 
 const sessionStore = useSessionStore();
-const { sessionState, publicHeaderFooter } = storeToRefs(sessionStore);
+const { sessionState } = storeToRefs(sessionStore);
 const { checkSession, login, logout } = sessionStore;
 
 const toastStore = useToastStore();
@@ -37,23 +41,27 @@ const { isDirty, saveState } = storeToRefs(dataStore);
 const uiStore = useUIStore();
 const { layoutMode } = storeToRefs(uiStore);
 
+const versionStore = useVersionStore();
+const { 
+  showModal: showVersionChangelogModal, 
+  showUpdateNotice, 
+  latestRelease: versionReleaseInfo,
+  currentVersion
+} = storeToRefs(versionStore);
+
 const isLoggedIn = computed(() => sessionState.value === 'loggedIn');
 const isPublicRoute = computed(() => route.meta.isPublic);
 const isSessionLoading = computed(() => sessionState.value === 'loading');
-const isVpsPublicRoute = computed(() =>
-  isPublicRoute.value && (route.name === 'PublicVpsMonitor' || route.path === '/vps')
-);
 
 const showModernNavBar = computed(() => isLoggedIn.value && layoutMode.value === 'modern');
 const showLegacyHeader = computed(() => {
   if (showModernNavBar.value) return false;
   if (isLoggedIn.value) return true;
   if (isSessionLoading.value || !isPublicRoute.value) return false;
-  return !isVpsPublicRoute.value || publicHeaderFooter.value?.vpsPublicHeaderEnabled !== false;
+  return true;
 });
 const showPublicFooter = computed(() => {
-  if (!isVpsPublicRoute.value) return true;
-  return publicHeaderFooter.value?.vpsPublicFooterEnabled !== false;
+  return true;
 });
 const shouldShowFooter = computed(() => !isSessionLoading.value && (!isPublicRoute.value || showPublicFooter.value));
 
@@ -66,6 +74,10 @@ const shouldCenterMain = computed(() =>
 const showSavePrompt = computed(() =>
   layoutMode.value === 'modern' && (isDirty.value || saveState.value === 'success')
 );
+
+const showLegacyD1MigrationModal = ref(false);
+const legacyD1Details = ref({ hasLegacySubscriptions: false, hasLegacyProfiles: false });
+const pendingVersionModal = ref(false);
 
 // Determine which login component to show (Custom Path -> NotFound, else -> Login)
 const loginComponent = computed(() => {
@@ -87,8 +99,47 @@ onMounted(async () => {
 watch(sessionState, async (newVal) => {
   if (newVal === 'loggedIn') {
     await dataStore.fetchData();
+
+    try {
+      const result = await detectLegacyD1();
+      if (result?.success && result.data?.hasLegacyData) {
+        legacyD1Details.value = result.data;
+        showLegacyD1MigrationModal.value = true;
+      }
+    } catch {
+      // Non-blocking legacy check.
+    }
+
+    try {
+      await versionStore.checkVersion(showLegacyD1MigrationModal.value);
+    } catch {
+      // Non-blocking version check.
+    }
   }
 }, { immediate: true });
+
+const handleLegacyD1MigrationSuccess = async () => {
+  showLegacyD1MigrationModal.value = false;
+  await dataStore.fetchData(true);
+  if (pendingVersionModal.value) {
+    versionStore.openModal();
+  }
+};
+
+const handleLegacyD1MigrationClose = (value) => {
+  showLegacyD1MigrationModal.value = value;
+  if (!value && pendingVersionModal.value) {
+    versionStore.openModal();
+  }
+};
+
+const handleVersionModalConfirm = () => {
+  versionStore.closeModal();
+};
+
+const handleVersionModalSuppress = () => {
+  versionStore.suppressUpdateModal();
+};
 
 const handleSave = async () => {
   await dataStore.saveData();
@@ -143,6 +194,19 @@ aria-live="polite"
 </div>
 </div>
 
+<div v-if="showUpdateNotice && versionReleaseInfo" class="mb-4 rounded-lg border border-amber-200/70 bg-amber-50/90 px-4 py-3 text-amber-800 shadow-sm dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-200">
+<div class="flex items-start justify-between gap-4">
+<div class="space-y-1">
+<p class="text-sm font-semibold">检测到上游新版本 {{ versionReleaseInfo.tag_name }}</p>
+<p class="text-sm opacity-90">当前版本为 {{ currentVersion }}。建议在确认变更内容后安排升级。</p>
+<a v-if="versionReleaseInfo.html_url" :href="versionReleaseInfo.html_url" target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-2 text-sm font-medium underline underline-offset-2">
+查看发布说明
+</a>
+</div>
+<button @click="showUpdateNotice = false" class="rounded-md px-2 py-1 text-sm hover:bg-amber-100/80 dark:hover:bg-white/10">知道了</button>
+</div>
+</div>
+
         <SavePrompt :is-dirty="showSavePrompt" :save-state="saveState" @save="handleSave" @discard="handleDiscard" />
 
         <router-view v-if="layoutMode === 'modern'" v-slot="{ Component }">
@@ -175,6 +239,20 @@ aria-live="polite"
     </main>
 
 <Toast />
+    <LegacyD1MigrationModal
+      :show="showLegacyD1MigrationModal"
+      :details="legacyD1Details"
+      @update:show="handleLegacyD1MigrationClose"
+      @success="handleLegacyD1MigrationSuccess"
+    />
+    <VersionChangelogModal
+      :show="showVersionChangelogModal"
+      :release="versionReleaseInfo || {}"
+      :current-version="currentVersion"
+      @update:show="versionStore.closeModal"
+      @confirm="handleVersionModalConfirm"
+      @suppress="handleVersionModalSuppress"
+    />
     <Footer v-if="shouldShowFooter" />
 <ScrollToTop v-if="isLoggedIn || isPublicRoute" />
 </div>
