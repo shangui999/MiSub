@@ -7,7 +7,15 @@
 import { urlsToClashProxies } from '../../utils/url-to-clash.js';
 import { getUniqueName } from './name-utils.js';
 import { clashFix } from '../../utils/format-utils.js';
-import { POLICY_GROUPS, RULE_SETS, getBuiltinRules, getRemoteProviderDefinitions, DEFAULT_SELECT_GROUP, DEFAULT_RELAY_GROUP } from './builtin-rules-provider.js';
+import { 
+    POLICY_GROUPS, 
+    RULE_SETS, 
+    getBuiltinRules, 
+    getRemoteProviderDefinitions, 
+    DEFAULT_SELECT_GROUP, 
+    DEFAULT_RELAY_GROUP, 
+    pruneProxyGroups 
+} from './builtin-rules-provider.js';
 import yaml from 'js-yaml';
 
 /**
@@ -70,6 +78,7 @@ export function generateBuiltinClashConfig(nodeList, options = {}) {
     const {
         fileName = 'MiSub',
         enableUdp = true,
+        enableTfo = false,
         skipCertVerify = false,
         ruleLevel = 'std' // [New] 支持 base, std, full
     } = options;
@@ -82,25 +91,14 @@ export function generateBuiltinClashConfig(nodeList, options = {}) {
         .filter(line => line && !line.startsWith('#'));
 
     // 转换为 Clash 代理对象
-    let proxies = urlsToClashProxies(nodeUrls);
+    let proxies = urlsToClashProxies(nodeUrls, options);
 
     // 清理控制字符
     proxies = deepCleanControlChars(proxies);
 
-    // 应用 UDP 开关：强制设置所有节点的 UDP 参数
-    if (enableUdp) {
-        proxies.forEach(proxy => {
-            proxy.udp = true;
-        });
-    }
-
     // 强制跳过证书验证
-    if (skipCertVerify) {
-        proxies.forEach(proxy => {
-            proxy['skip-cert-verify'] = true;
-        });
-    }
-
+    // (已在 urlsToClashProxies 中全局处理)
+    
     // 处理重名节点
     deduplicateNames(proxies);
 

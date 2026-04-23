@@ -24,7 +24,20 @@ function buildProxyLine(proxy) {
         return `trojan=${server}:${port}, password=${proxy.password || ''}${extras.length ? `, ${extras.join(', ')}` : ''}, tag=${name}`;
     }
     if (type === 'ss' || type === 'shadowsocks') {
-        return `shadowsocks=${server}:${port}, method=${proxy.cipher || 'aes-128-gcm'}, password=${proxy.password || ''}, tag=${name}`;
+        const extras = [];
+        const plugin = proxy.plugin || '';
+        const opts = proxy['plugin-opts'] || proxy.pluginOpts || {};
+        if (plugin === 'obfs-local' || proxy.obfs) {
+            extras.push(`obfs=${proxy.obfs || opts.mode}`);
+            if (proxy['obfs-host'] || opts.host) extras.push(`obfs-host=${proxy['obfs-host'] || opts.host}`);
+        } else if (plugin === 'v2ray-plugin' || opts.mode === 'websocket') {
+            extras.push('obfs=ws');
+            if (opts.path) extras.push(`obfs-uri=${opts.path}`);
+            if (opts.host) extras.push(`obfs-host=${opts.host}`);
+            if (opts.tls || opts.mode === 'websocket-tls') extras.push('over-tls=true');
+        }
+        if (proxy.udp) extras.push('udp-relay=true');
+        return `shadowsocks=${server}:${port}, method=${proxy.cipher || 'aes-128-gcm'}, password=${proxy.password || ''}${extras.length ? `, ${extras.join(', ')}` : ''}, tag=${name}`;
     }
     if (type === 'vmess') {
         const extras = [];
@@ -142,7 +155,7 @@ export function renderQuanxFromTemplateModel(model, options = {}) {
 
     // Extraction of remote rules for Quantumult X
     const remoteRules = normalizedModel.rules.filter(r => String(r.type).toUpperCase() === 'RULE-SET' && r.value.startsWith('http'));
-    const filterRemoteLines = remoteRules.map(r => `${r.value}, tag=${r.policy}, policy=${r.policy}, enabled=true`);
+    const filterRemoteLines = remoteRules.map(r => `filter_remote, ${r.value}, tag=${r.policy}, force-policy=${r.policy}, update-interval=86400, enabled=true`);
     const localRules = normalizedModel.rules.filter(r => !remoteRules.includes(r));
 
     return [

@@ -35,7 +35,7 @@ function buildOutbound(proxy) {
     }
 
     if (type === 'ss' || type === 'shadowsocks') {
-        return {
+        const outbound = {
             tag,
             type: 'shadowsocks',
             server,
@@ -43,6 +43,23 @@ function buildOutbound(proxy) {
             method: proxy.cipher || 'aes-128-gcm',
             password: proxy.password || ''
         };
+        const plugin = proxy.plugin || '';
+        const opts = proxy['plugin-opts'] || proxy.pluginOpts || {};
+        if (plugin === 'v2ray-plugin' || opts.mode === 'websocket') {
+            outbound.transport = {
+                type: 'ws',
+                path: opts.path || '/',
+                headers: opts.host ? { Host: opts.host } : {}
+            };
+            if (opts.tls || opts.mode === 'websocket-tls') {
+                outbound.tls = {
+                    enabled: true,
+                    server_name: opts.host || proxy.servername || proxy.sni || server,
+                    insecure: proxy['skip-cert-verify'] === true || proxy.skipCertVerify === true
+                };
+            }
+        }
+        return outbound;
     }
 
     if (type === 'vmess') {
@@ -281,13 +298,19 @@ function mapRuleToSingbox(rule) {
     return null;
 }
 
+function detectRuleSetFormat(url) {
+    const raw = String(url || '').trim().toLowerCase();
+    if (!raw) return 'source';
+    return raw.endsWith('.srs') ? 'binary' : 'source';
+}
+
 function buildRuleSets(rules) {
     const remoteRuleSets = rules
         .filter(rule => String(rule.type || '').toLowerCase() === 'rule-set' && rule.source === 'remote')
         .map(rule => ({
             tag: sanitizeTag(`${rule.policy}_${rule.value}`),
             type: 'remote',
-            format: 'binary',
+            format: detectRuleSetFormat(rule.value),
             url: rule.value,
             download_detour: 'DIRECT'
         }));

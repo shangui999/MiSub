@@ -1,7 +1,7 @@
 import { StorageFactory } from '../../storage-adapter.js';
-import { migrateConfigSettings, formatBytes, migrateProfileIds } from '../utils.js';
+import { migrateConfigSettings, formatBytes, migrateProfileIds, base64EncodeUtf8 } from '../utils.js';
 import { generateCombinedNodeList } from '../../services/subscription-service.js';
-import { sendEnhancedTgNotification } from '../notifications.js';
+import { sendEnhancedTgNotification, tgEscape } from '../notifications.js';
 import { KV_KEY_SUBS, KV_KEY_PROFILES, KV_KEY_SETTINGS, DEFAULT_SETTINGS as defaultSettings } from '../config.js';
 import { createDisguiseResponse } from '../disguise-page.js';
 import { generateCacheKey, setCache } from '../../services/node-cache-service.js';
@@ -9,7 +9,7 @@ import { resolveRequestContext } from './request-context.js';
 import { resolveNodeListWithCache } from './cache-manager.js';
 import { ProcessorService } from '../../services/processor-service.js';
 import { logAccessSuccess, shouldSkipLogging as shouldSkipAccessLog } from './access-logger.js';
-import { isBrowserAgent, determineTargetFormat } from './user-agent-utils.js'; // [Added] Import centralized util
+import { isBrowserAgent, determineTargetFormat, isMetaCore } from './user-agent-utils.js'; // [Added] Import centralized util
 import { authMiddleware } from '../auth-middleware.js';
 import { transformBuiltinSubscription } from './transformer-factory.js';
 import { fetchTransformTemplate } from './transform-template-cache.js';
@@ -52,6 +52,21 @@ function extractProxySectionFromBuiltin(content, targetFormat) {
             .join('\n');
     }
 
+    if (targetFormat === 'singbox' || targetFormat === 'sing-box') {
+        try {
+            const config = JSON.parse(content);
+            if (config.outbounds && Array.isArray(config.outbounds)) {
+                // 过滤掉 direct, block, dns-out 等元 outbound
+                const proxies = config.outbounds.filter(o => 
+                    o.type !== 'direct' && o.type !== 'block' && o.type !== 'dns'
+                );
+                return JSON.stringify(proxies, null, 2);
+            }
+        } catch {
+            return '';
+        }
+    }
+
     return '';
 }
 
@@ -81,6 +96,11 @@ export function resolveTemplateSource(value) {
         return { kind: 'builtin', value: normalizedValue.slice('builtin:'.length) };
     }
     return { kind: 'remote', value: normalizedValue };
+}
+
+export function resolveExternalTemplateConfigUrl(templateSource) {
+    if (!templateSource || typeof templateSource !== 'object') return '';
+    return templateSource.kind === 'remote' ? String(templateSource.value || '').trim() : '';
 }
 
 /**
@@ -114,7 +134,15 @@ export async function handleMisubRequest(context) {
     const config = migrateConfigSettings({ ...defaultSettings, ...settings });
     context.accessLogPersistenceMode = config.accessLogPersistenceMode || 'light';
 
-
+    // [Subconverter API] 提取 URL 控制参数，用于覆盖默认设置
+    const urlInclude = url.searchParams.get('include');
+    const urlExclude = url.searchParams.get('exclude');
+    const urlRename = url.searchParams.get('rename');
+    const urlEmoji = url.searchParams.get('emoji'); // true/false
+    const urlUdp = url.searchParams.get('udp');     // true/false
+    const urlTfo = url.searchParams.get('tfo');     // true/false
+    const urlScv = url.searchParams.get('scv');     // true/false (skip-cert-verify)
+    const urlList = url.searchParams.get('list') === 'true';
 
     const isBrowser = isBrowserAgent(userAgentHeader);
 
@@ -141,12 +169,15 @@ export async function handleMisubRequest(context) {
 
     const DEFAULT_EXPIRED_NODE = `trojan://00000000-0000-0000-0000-000000000000@127.0.0.1:443#${encodeURIComponent('您的订阅已失效')}`;
 
+    let currentProfile = null;
+
     if (profileIdentifier) {
         // [修正] 使用 config 變量
         if (!token || token !== config.profileToken) {
             return new Response('Invalid Profile Token', { status: 403 });
         }
-        const profile = allProfiles.find(p => (p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier);
+        currentProfile = allProfiles.find(p => (p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier);
+        const profile = currentProfile;
         if (profile && profile.enabled) {
             // Check if the profile has an expiration date and if it's expired
             if (profile.expiresAt) {
@@ -263,6 +294,38 @@ export async function handleMisubRequest(context) {
         }
     }
 
+    // [Subconverter Engine Selection] Priority: URL Parameter > Profile Settings > Global Settings
+    const profileSub = currentProfile?.subconverter || {};
+    const globalSub = config.subconverter || {};
+    
+    const builtinParam = (url.searchParams.get('builtin') || '').toLowerCase();
+    const engineParam = (url.searchParams.get('engine') || '').toLowerCase();
+    // [Optimization] Respect user defined engine mode while preventing loops for non-browser agents (backend fetchers)
+    const defaultEngineMode = profileSub.engineMode || globalSub.engineMode || 'builtin';
+    
+    const effectiveEngine = engineParam || (builtinParam === 'external' ? 'external' : (builtinParam === 'true' ? 'builtin' : '')) || defaultEngineMode;
+    const isExternalMode = effectiveEngine === 'external';
+    const useBuiltin = !isExternalMode;
+
+    
+    const globalTemplateUrl = resolveTemplateUrl(config.transformConfigMode, config.transformConfig, '');
+    const templateUrl = currentProfile
+        ? resolveTemplateUrl(currentProfile.transformConfigMode, currentProfile.transformConfig, globalTemplateUrl)
+        : globalTemplateUrl;
+    const templateSource = resolveTemplateSource(templateUrl);
+
+    // [逻辑统一] 规则等级：URL 参数 > 订阅组设置 > 全局设置 > 默认值 (std)
+    // [重要变更] 如果使用了远程自定义配置 (templateSource.kind === 'remote')，则完全禁用内置等级 (强制为 none)
+    const resolvedProfileLevel = currentProfile?.ruleLevel || currentProfile?.clashRuleLevel || '';
+    const resolvedGlobalLevel = config.ruleLevel || config.clashRuleLevel || 'std';
+    
+    let ruleLevel;
+    if (templateSource.kind === 'remote') {
+        ruleLevel = 'none';
+    } else {
+        ruleLevel = url.searchParams.get('level') || url.searchParams.get('ruleLevel') || resolvedProfileLevel || resolvedGlobalLevel;
+    }
+
     // === 缓存机制：快速响应客户端请求 ===
     const cacheKey = generateCacheKey(
         profileIdentifier ? 'profile' : 'token',
@@ -335,13 +398,44 @@ export async function handleMisubRequest(context) {
 
         const generationSettings = {
             ...effectivePrefixSettings,
-            nodeTransform: effectiveNodeTransform,
+            nodeTransform: { ...effectiveNodeTransform },
             name: subName,
-            // [修复] 显式传递订阅组级别的操作符和过滤规则
-            operators: activeProfile?.operators,
-            exclude: activeProfile?.exclude,
-            include: activeProfile?.include
+            operators: Array.isArray(activeProfile?.operators) ? [...activeProfile.operators] : [],
+            exclude: urlExclude || activeProfile?.exclude,
+            include: urlInclude || activeProfile?.include
         };
+
+        // [Subconverter API] 动态注入更名算子 (rename=old@new|A@B)
+        if (urlRename) {
+            const renameGroups = urlRename.split('|');
+            renameGroups.forEach(group => {
+                const [regex, replace] = group.split('@');
+                if (regex) {
+                    generationSettings.operators.push({
+                        type: 'rename',
+                        enabled: true,
+                        params: {
+                            regex: {
+                                enabled: true,
+                                rules: [{
+                                    pattern: regex,
+                                    replacement: replace || '',
+                                    flags: 'gi'
+                                }]
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        // [Subconverter API] 控制 Emoji 注入
+        if (urlEmoji === 'false') {
+            generationSettings.nodeTransform.addFlagEmoji = false;
+            generationSettings.nodeTransform.removeFlagEmoji = true;
+        } else if (urlEmoji === 'true') {
+            generationSettings.nodeTransform.addFlagEmoji = true;
+        }
 
         const freshNodes = await generateCombinedNodeList(
             context, // 传入完整 context
@@ -349,7 +443,11 @@ export async function handleMisubRequest(context) {
             userAgentHeader,
             targetMisubs,
             prependedContentForSubconverter,
-            generationSettings
+            {
+                ...generationSettings,
+                // [强制透传] 确保 ruleLevel 在订阅组内能够生效
+                ruleLevel: ruleLevel || generationSettings.ruleLevel
+            }
         );
         const sourceNames = targetMisubs
             .filter(s => typeof s?.url === 'string' && s.url.startsWith('http'))
@@ -370,6 +468,125 @@ export async function handleMisubRequest(context) {
     console.log(`[MiSub Nodes] Count/Length: ${combinedNodeList ? combinedNodeList.length : 0}`);
 
     const domain = url.hostname;
+
+    // [Support] External Subconverter Logic
+    // 1. If 'nodes' format requested, return plain text nodes (DataSource for external converters)
+    if (targetFormat === 'nodes') {
+        const contentToReturn = isProfileExpired ? (DEFAULT_EXPIRED_NODE + '\n') : combinedNodeList;
+        // [兼容性优化] 第三方转换后端对明文列表的支持通常比 Base64 更好。
+        // 同时对于 Cloudflare 而言，明文输出更有利于其边缘节点的流式处理。
+        return new Response(contentToReturn, { 
+            headers: { 
+                "Content-Type": "text/plain; charset=utf-8", 
+                'Cache-Control': 'no-store, no-cache',
+                'X-MiSub-Mode': 'node-export-plain'
+            } 
+        });
+    }
+
+    // 2. If external mode active, build the redirect URL and return 302
+    if (isExternalMode && targetFormat !== 'base64') {
+        let backend = url.searchParams.get('backend') || profileSub.backend || globalSub.defaultBackend || "https://sub.id9.cc/sub?";
+        
+        // [加固] 防止 UI 标签泄漏到配置中
+        if (typeof backend === 'string' && (backend.includes('后端') || backend.includes('参数'))) {
+            backend = "https://subapi.cmliussss.net/sub?";
+        }
+
+        // [自动纠错] 如果地址不带 http/https 协议，自动补全
+        if (backend && typeof backend === 'string' && !backend.startsWith('http://') && !backend.startsWith('https://')) {
+            backend = 'http://' + backend;
+        }
+
+        const externalUrl = new URL(backend);
+
+        // [Fix] Automatically append '/sub' if the backend URL only has a root path.
+        // Most subconverter backends (FatSheep, subapi, etc.) use /sub as the conversion endpoint.
+        if (externalUrl.pathname === '/' || !externalUrl.pathname) {
+            externalUrl.pathname = '/sub';
+        }
+        // [优化] 解析 targetFormat，支持带参数的格式（如 surge&ver=4）
+        const [targetBase, ...targetParams] = targetFormat.split('&');
+        externalUrl.searchParams.set('target', targetBase);
+        targetParams.forEach(p => {
+            const [k, v] = p.split('=');
+            if (k && v) externalUrl.searchParams.set(k, v);
+        });
+        
+        // Data source is THIS worker, but forcing builtin and nodes format
+        const dataSourceUrl = new URL(request.url);
+        
+        // [加固] 彻底清理 URL 参数，防止参数污染导致后端返回 400 错误
+        // [优化] 不再强制注入 target=nodes，因为非浏览器请求已默认使用内置引擎
+        // [关键] 显式注入 builtin=true 确保后端拉取数据时强制走内置逻辑，打破重定向环
+        const paramsToClear = ['target', 'engine', 'builtin', 'clash', 'singbox', 'surge', 'loon', 'quanx', 'egern', 'base64', 'v2ray', 'trojan', 'list', 'include', 'exclude'];
+        paramsToClear.forEach(p => dataSourceUrl.searchParams.delete(p));
+        dataSourceUrl.searchParams.set('builtin', 'true');
+
+        // [关键修复] 确保后端拉取数据时包含身份令牌
+        // 只有当 URL 路径中不包含令牌时，才在查询参数中显式注入
+        const pathSegments = dataSourceUrl.pathname.split('/').filter(Boolean);
+        const hasTokenInPath = pathSegments.some(seg => seg === config.mytoken || seg === config.profileToken);
+
+        if (!hasTokenInPath && !dataSourceUrl.searchParams.has('token')) {
+            const authToken = token || currentProfile?.token || config.mytoken;
+            if (authToken) dataSourceUrl.searchParams.set('token', authToken);
+        }
+
+        externalUrl.searchParams.set('url', dataSourceUrl.toString());
+        
+        // Map Boolean Flags
+        const effectiveOptions = { ...globalSub.defaultOptions, ...profileSub.options };
+        const flagMap = { udp: 'udp', emoji: 'emoji', scv: 'scv', sort: 'sort', tfo: 'tfo', list: 'list' };
+        
+        // [元数据核心支持] 如果是 Meta 核心，告知第三方转换后端使用 Meta 语法
+        if (isMetaCore(userAgentHeader, url.searchParams)) {
+            externalUrl.searchParams.set('meta', 'true');
+        }
+
+        Object.entries(flagMap).forEach(([key, paramName]) => {
+            const val = url.searchParams.has(paramName) 
+                ? url.searchParams.get(paramName) === 'true' 
+                : effectiveOptions[key];
+            externalUrl.searchParams.set(paramName, val ? 'true' : 'false');
+        });
+
+        // Pass Remote Config if applicable
+        const externalTemplateConfigUrl = resolveExternalTemplateConfigUrl(templateSource);
+        if (externalTemplateConfigUrl) {
+            externalUrl.searchParams.set('config', externalTemplateConfigUrl);
+        }
+
+        // Add File Name
+        externalUrl.searchParams.set('filename', subName);
+
+        // [Access Log] Send notification for external redirection
+        if (!url.searchParams.has('callback_token') && !shouldSkipLogging && config.enableAccessLog) {
+            const clientIp = request.headers.get('CF-Connecting-IP')
+                || request.headers.get('X-Real-IP')
+                || request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim()
+                || 'N/A';
+            context.waitUntil(
+                sendEnhancedTgNotification(
+                    config,
+                    '🛰️ <b>订阅被访问</b> (第三方转换)',
+                    clientIp,
+                    `<b>域名:</b> <code>${tgEscape(domain)}</code>\n<b>客户端:</b> <code>${tgEscape(userAgentHeader)}</code>\n<b>请求格式:</b> <code>${tgEscape(targetFormat)}</code>\n<b>订阅组:</b> <code>${tgEscape(subName)}</code>`
+                )
+            );
+        }
+
+        // [重要修复] 使用手动构建出的 302 响应，以确保头部是可变的 (Mutable)
+        return new Response(null, {
+            status: 302,
+            headers: {
+                'Location': externalUrl.toString(),
+                'Cache-Control': 'no-store, no-cache',
+                'X-MiSub-Mode': 'external-redirect-v2',
+                ...(templateSource.kind === 'builtin' ? { 'X-MiSub-Template-Warning': 'external-engine-ignores-builtin-template' } : {})
+            }
+        });
+    }
 
     if (targetFormat === 'base64') {
         let contentToEncode;
@@ -393,9 +610,9 @@ export async function handleMisubRequest(context) {
             context.waitUntil(
                 sendEnhancedTgNotification(
                     config,
-                    '🛰️ *订阅被访问*',
+                    '🛰️ <b>订阅被访问</b>',
                     clientIp,
-                    `*域名:* \`${domain}\`\n*客户端:* \`${userAgentHeader}\`\n*请求格式:* \`${targetFormat}\`\n*订阅组:* \`${subName}\``
+                    `<b>域名:</b> <code>${tgEscape(domain)}</code>\n<b>客户端:</b> <code>${tgEscape(userAgentHeader)}</code>\n<b>请求格式:</b> <code>${tgEscape(targetFormat)}</code>\n<b>订阅组:</b> <code>${tgEscape(subName)}</code>`
                 )
             );
 
@@ -415,38 +632,24 @@ export async function handleMisubRequest(context) {
             }
         }
 
-        return new Response(btoa(unescape(encodeURIComponent(contentToEncode))), { headers });
+        return new Response(base64EncodeUtf8(contentToEncode), { headers });
     }
 
-    const builtinMode = (url.searchParams.get('builtin') || '').toLowerCase();
-    const useBuiltin = builtinMode !== 'external';
-    const currentProfile = profileIdentifier ? allProfiles.find(p => (p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier) : null;
-    
-    const globalTemplateUrl = resolveTemplateUrl(config.transformConfigMode, config.transformConfig, '');
-    const templateUrl = currentProfile
-        ? resolveTemplateUrl(currentProfile.transformConfigMode, currentProfile.transformConfig, globalTemplateUrl)
-        : globalTemplateUrl;
-    const templateSource = resolveTemplateSource(templateUrl);
 
-    // [逻辑统一] 规则等级：URL 参数 > 订阅组设置 > 全局设置 > 默认值 (std)
-    // [重要变更] 如果使用了远程自定义配置 (templateSource.kind === 'remote')，则完全禁用内置等级 (强制为 none)
-    const resolvedProfileLevel = currentProfile?.ruleLevel || currentProfile?.clashRuleLevel || '';
-    const resolvedGlobalLevel = config.ruleLevel || config.clashRuleLevel || 'std';
-    
-    let ruleLevel;
-    if (templateSource.kind === 'remote') {
-        ruleLevel = 'none';
-    } else {
-        ruleLevel = url.searchParams.get('level') || url.searchParams.get('ruleLevel') || resolvedProfileLevel || resolvedGlobalLevel;
-    }
+    // [Subconverter API] URL 参数优先级高于全局/Profile 设置
+    const finalSkipCertVerify = urlScv !== null ? (urlScv === 'true' || urlScv === '1') : shouldSkipCertificateVerify;
+    const finalEnableUdp = urlUdp !== null ? (urlUdp === 'true' || urlUdp === '1') : shouldEnableUdp;
+    const finalEnableTfo = urlTfo === 'true' || urlTfo === '1';
 
     const builtinOptions = {
         fileName: subName,
         managedConfigUrl: '',
         interval: config.UpdateInterval || 86400,
-        skipCertVerify: shouldSkipCertificateVerify,
-        enableUdp: shouldEnableUdp,
-        ruleLevel: ruleLevel // 统一后的规则等级
+        skipCertVerify: finalSkipCertVerify,
+        enableUdp: finalEnableUdp,
+        enableTfo: finalEnableTfo,
+        ruleLevel: ruleLevel, // 统一后的规则等级
+        isMeta: isMetaCore(userAgentHeader, url.searchParams)
     };
 
     const managedConfigUrl = buildManagedConfigUrl(request.url);
@@ -475,11 +678,18 @@ export async function handleMisubRequest(context) {
                 return acc;
             }, { upload: 0, download: 0, total: 0, expire: 0 });
 
-            const userInfoHeader = totalUserInfo.total > 0 
-                ? `upload=${totalUserInfo.upload}; download=${totalUserInfo.download}; total=${totalUserInfo.total}; expire=${totalUserInfo.expire}`
+            const safeUserInfo = {
+                upload: isFinite(totalUserInfo.upload) ? totalUserInfo.upload : 0,
+                download: isFinite(totalUserInfo.download) ? totalUserInfo.download : 0,
+                total: isFinite(totalUserInfo.total) ? totalUserInfo.total : 0,
+                expire: isFinite(totalUserInfo.expire) ? totalUserInfo.expire : 0
+            };
+
+            const userInfoHeader = safeUserInfo.total > 0 
+                ? `upload=${safeUserInfo.upload}; download=${safeUserInfo.download}; total=${safeUserInfo.total}; expire=${safeUserInfo.expire}`
                 : null;
 
-            const { content: finalContent, contentType, headers: resultHeaders } = await ProcessorService.renderOutput({
+            let { content: finalContent, contentType, headers: resultHeaders } = await ProcessorService.renderOutput({
                 targetFormat,
                 combinedNodeList,
                 subName,
@@ -491,10 +701,25 @@ export async function handleMisubRequest(context) {
                 userInfoHeader
             });
 
+            // [Subconverter API] 处理 list=true 逻辑：仅输出节点片段
+            if (urlList) {
+                const extracted = extractProxySectionFromBuiltin(finalContent, targetFormat);
+                if (extracted) {
+                    finalContent = extracted;
+                    contentType = 'text/plain; charset=utf-8';
+                }
+            }
+
             const isJson = targetFormat === 'singbox' || targetFormat === 'sing-box';
+            
+            // [RFC 6266 / RFC 5987] Standardized Content-Disposition
+            // filename: ASCII-only fallback, filename*: UTF-8 encoded
+            const asciiSubName = subName.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
+            const encodedSubName = encodeURIComponent(subName).replace(/'/g, "%27").replace(/\(/g, "%28").replace(/\)/g, "%29").replace(/\*/g, "%2A");
+            
             const responseHeaders = new Headers({
-                "Content-Disposition": `attachment; filename="${encodeURIComponent(subName)}"; filename*=utf-8''${encodeURIComponent(subName)}`,
-                'Content-Type': contentType,
+                "Content-Disposition": `attachment; filename="${asciiSubName}"; filename*=utf-8''${encodedSubName}`,
+                'Content-Type': contentType || 'text/plain; charset=utf-8',
                 'Cache-Control': 'no-store, no-cache',
                 'X-MiSub-Mode': `builtin-${targetFormat}`,
                 'Access-Control-Allow-Origin': '*'
@@ -516,9 +741,9 @@ export async function handleMisubRequest(context) {
                 context.waitUntil(
                     sendEnhancedTgNotification(
                         config,
-                        '🛰️ *订阅被访问* (内置转换)',
+                        '🛰️ <b>订阅被访问</b> (内置转换)',
                         clientIp,
-                        `*域名:* \`${domain}\`\n*客户端:* \`${userAgentHeader}\`\n*请求格式:* \`${targetFormat}\`\n*订阅组:* \`${subName}\``
+                        `<b>域名:</b> <code>${tgEscape(domain)}</code>\n<b>客户端:</b> <code>${tgEscape(userAgentHeader)}</code>\n<b>请求格式:</b> <code>${tgEscape(targetFormat)}</code>\n<b>订阅组:</b> <code>${tgEscape(subName)}</code>`
                     )
                 );
 
@@ -537,7 +762,7 @@ export async function handleMisubRequest(context) {
                 }
             }
 
-            return new Response(finalContent, { headers: responseHeaders });
+            return new Response(finalContent || '', { headers: responseHeaders });
 
         } catch (e) {
             console.error(`[Builtin${targetFormat}] Generation failed:`, e);
@@ -549,5 +774,5 @@ export async function handleMisubRequest(context) {
         base64Headers[key] = value;
     });
 
-    return new Response(btoa(unescape(encodeURIComponent(combinedNodeList))), { headers: base64Headers });
+    return new Response(base64EncodeUtf8(combinedNodeList), { headers: base64Headers });
 }

@@ -3,7 +3,7 @@
  * 将节点 URL 列表转换为基础可用的 sing-box JSON 配置。
  */
 
-import { urlToClashProxy } from '../../utils/url-to-clash.js';
+import { urlToClashProxy, urlsToClashProxies } from '../../utils/url-to-clash.js';
 import { getUniqueName } from './name-utils.js';
 import { groupNodeLinesByRegion } from './region-groups.js';
 import { POLICY_GROUPS, getBuiltinRules, getRemoteProviderDefinitions, DEFAULT_SELECT_GROUP, DEFAULT_RELAY_GROUP, pruneProxyGroups } from './builtin-rules-provider.js';
@@ -44,6 +44,24 @@ function buildOutbound(proxy) {
         outbound.method = proxy.cipher || 'aes-128-gcm';
         outbound.password = proxy.password || '';
         if (proxy.udp) outbound.udp_over_tcp = false;
+
+        // 插件支持 (v2ray-plugin 映射为 Sing-box transport)
+        const plugin = proxy.plugin || '';
+        const opts = proxy['plugin-opts'] || proxy.pluginOpts || {};
+        if (plugin === 'v2ray-plugin' || opts.mode === 'websocket') {
+            outbound.transport = {
+                type: 'ws',
+                path: opts.path || '/',
+                headers: opts.host ? { Host: opts.host } : {}
+            };
+            if (opts.tls || opts.mode === 'websocket-tls') {
+                outbound.tls = {
+                    enabled: true,
+                    server_name: opts.host || server,
+                    insecure: !!proxy['skip-cert-verify']
+                };
+            }
+        }
     } else if (type === 'vmess') {
         outbound.type = 'vmess';
         outbound.server = server;
@@ -196,13 +214,17 @@ function buildOutbound(proxy) {
         outbound.tls.enabled = true;
         outbound.tls.insecure = true;
     }
-    if (proxy.sni || proxy.servername) {
+    if ((proxy.sni || proxy.servername) && (type !== 'ss' && type !== 'shadowsocks' || proxy.tls || outbound.tls?.enabled)) {
         outbound.tls = outbound.tls || {};
         outbound.tls.server_name = proxy.sni || proxy.servername;
     }
     if (proxy['client-fingerprint']) {
         outbound.tls = outbound.tls || {};
         outbound.tls.utls = { enabled: true, fingerprint: proxy['client-fingerprint'] };
+    }
+
+    if (proxy.tfo) {
+        outbound.tcp_fast_open = true;
     }
 
     return outbound;
@@ -214,6 +236,7 @@ export function generateBuiltinSingboxConfig(nodeList, options = {}) {
         managedConfigUrl = '',
         skipCertVerify = false,
         enableUdp = false,
+        enableTfo = false,
         ruleLevel = 'std'
     } = options;
 
@@ -227,13 +250,12 @@ export function generateBuiltinSingboxConfig(nodeList, options = {}) {
     const usedNames = new Map();
     const nodeEntries = [];
 
-    for (const url of nodeUrls) {
-        const clashProxy = urlToClashProxy(url);
-        if (!clashProxy) continue;
+    const proxies = urlsToClashProxies(nodeUrls, options);
 
-        if (skipCertVerify) clashProxy['skip-cert-verify'] = true;
-        if (enableUdp) clashProxy.udp = true;
-
+    // 应用 UDP 开关
+    // (已在 urlsToClashProxies 中全局处理)
+    
+    for (const clashProxy of proxies) {
         const baseName = sanitizeName(clashProxy.name);
         clashProxy.name = getUniqueName(baseName, usedNames);
 
